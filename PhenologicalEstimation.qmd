@@ -1,0 +1,410 @@
+---
+title: "PhenologicalEstimation"
+format: html
+editor: visual
+---
+
+### Heading Estimation
+
+#### Library Import
+
+```{R}
+library(tidyverse)
+library(lme4)
+library(gsheet)
+library(ggplot2)
+library(readxl)
+library(here)
+```
+
+#### Data Input
+
+```{R}
+# Read and prepare xlsx file
+file_path <- here("InputData", "TrialsPhenologicalEstimation_Input.xlsx")
+df <- read_excel(file_path) %>%
+  mutate(
+    site        = factor(site),
+    GDD_heading = as.numeric(GDD_heading),
+    days_to_heading = as.numeric(days_to_heading),
+    mean_temp_cycle = as.numeric(mean_temp_cycle),
+    year        = as.integer(year),
+    cultivar    = factor(cultivar),
+    environment = interaction(site, year, drop = TRUE)
+  ) %>%
+  filter(!site %in% c("Lavras", "Planaltina")) %>%
+  filter(!cultivar %in% c("BRS 264", "BRS264"))
+df$days_to_maturity <- as.integer(difftime(as.Date(df$heading_date, format = "%Y-%m-%d"), as.Date(df$sowing_date, format = "%Y-%m-%d"), units = "days"))
+
+## Helper: pick the first available temperature-mean column
+temp_candidates <- c("mean_temp_cycle", "Tmean_cycle", "tmean_cycle", "Tmean_sow_heading", "Tmean_sowing_heading")
+temp_col <- temp_candidates[temp_candidates %in% names(df)][1]
+if (is.na(temp_col)) temp_col <- NA_character_
+
+# Observed environment means
+obs_env <- df %>%
+  group_by(environment) %>%
+  summarise(
+    site        = first(site),
+    year        = first(year),
+    GDD_obs     = mean(GDD_heading, na.rm = TRUE),
+    n_obs       = n(),
+    n_cultivars = n_distinct(cultivar),
+    mean_T      = if (!is.na(temp_col)) mean(.data[[temp_col]], na.rm = TRUE) else NA_real_,
+    .groups     = "drop"
+  )
+
+```
+
+#### Model fitting and Prediction
+
+```{R}
+# Fit mixed model
+m_gdd <- lmer(GDD_heading ~ 1 + (1 | cultivar) + (1 | environment), data = df, REML = TRUE)
+confint(m_gdd)
+```
+
+```{R}
+# Predicted environment means: mu + BLUP(environment)
+mu_hat <- as.numeric(fixef(m_gdd)[1])
+var_mu_hat <- as.numeric(vcov(m_gdd)[1,1])
+
+re_env <- ranef(m_gdd, condVar = TRUE)$environment
+postVar_arr <- attr(re_env, "postVar")
+postVar_vec <- as.numeric(postVar_arr[1,1,])
+
+pred_env_in <- re_env %>%
+  rownames_to_column("environment") %>%
+  rename(b_env = `(Intercept)`) %>%
+  mutate(
+    postVar = postVar_vec,
+    se_pred = sqrt(var_mu_hat + postVar),
+    GDD_pred = mu_hat + b_env,
+    GDD_pred_lo = GDD_pred - 1.96 * se_pred,
+    GDD_pred_hi = GDD_pred + 1.96 * se_pred
+  ) %>%
+  dplyr::select(environment, GDD_pred, GDD_pred_lo, GDD_pred_hi, se_pred)
+```
+
+#### Evaluation assessment
+
+```{R}
+# Evaluate predictions 
+cmp_in <- obs_env %>%
+  left_join(pred_env_in, by = "environment") %>%
+  mutate(
+    error = GDD_obs - GDD_pred,
+    abs_error = abs(error),
+    covered = (GDD_obs >= GDD_pred_lo & GDD_obs <= GDD_pred_hi)
+  )
+
+rmse_in <- sqrt(mean(cmp_in$error^2, na.rm = TRUE))
+mae_in  <- mean(cmp_in$abs_error, na.rm = TRUE)
+bias_in <- mean(cmp_in$error, na.rm = TRUE)
+coverage_in <- mean(cmp_in$covered, na.rm = TRUE)
+
+cat("\nIn-sample (mu + env BLUP) agreement across environments\n")
+cat("RMSE (GDD):", round(rmse_in, 1), " | MAE (GDD):", round(mae_in, 1), " | Bias (GDD):", round(bias_in, 1),
+    " | 95% CI coverage:", scales::percent(coverage_in), "\n\n")
+```
+
+```{R}
+# Observed vs predicted Plot
+Heading_EnvMeansCorrPlot <- ggplot(cmp_in, aes(x = GDD_pred, y = GDD_obs)) +
+  geom_errorbarh(aes(xmin = GDD_pred_lo, xmax = GDD_pred_hi), height = 0, alpha = 0.6) +
+  geom_point(size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(
+    x = "Predicted trial mean GDD (mu + env BLUP)",
+    y = "Observed trial mean GDD",
+    title = "Heading",
+    subtitle = paste0("RMSE=", round(rmse_in, 1),
+                      " GDD; MAE=", round(mae_in, 1),
+                      " GDD; Bias=", round(bias_in, 1))
+  ) +
+  theme_minimal(base_size = 14) +
+  coord_equal()
+print(Heading_EnvMeansCorrPlot)
+```
+
+```{R}
+# LOEO-CV evaluation
+envs <- obs_env$environment
+loeo <- map_dfr(envs, function(e_out) {
+  train <- df %>% filter(environment != e_out)
+  m <- lmer(GDD_heading ~ 1 + (1 | cultivar) + (1 | environment), data = train, REML = TRUE)
+  
+  mu <- as.numeric(fixef(m)[1])
+  # approx se of intercept from model covariance
+  var_mu <- as.numeric(vcov(m)[1,1])
+  se_mu  <- sqrt(var_mu)
+  ci_lo  <- mu - 1.96 * se_mu
+  ci_hi  <- mu + 1.96 * se_mu
+  
+  tibble(environment = e_out,
+         GDD_pred = mu,
+         GDD_pred_lo = ci_lo,
+         GDD_pred_hi = ci_hi,
+         se_pred = se_mu)
+})
+
+cv_env <- obs_env %>%
+  left_join(loeo, by = "environment") %>%
+  mutate(
+    error     = GDD_obs - GDD_pred,
+    abs_error = abs(error),
+    covered   = (GDD_obs >= GDD_pred_lo & GDD_obs <= GDD_pred_hi),
+    # convert GDD CI to days if mean_T available
+    error_days = if_else(!is.na(mean_T), error / mean_T, NA_real_),
+    GDD_pred_lo_days = if_else(!is.na(mean_T), GDD_pred_lo / mean_T, NA_real_),
+    GDD_pred_hi_days = if_else(!is.na(mean_T), GDD_pred_hi / mean_T, NA_real_)
+  )
+
+rmse <- sqrt(mean(cv_env$error^2, na.rm = TRUE))
+mae  <- mean(cv_env$abs_error, na.rm = TRUE)
+bias <- mean(cv_env$error, na.rm = TRUE)
+
+cat("\nLOEO-CV (new environment; prediction = mu only)\n")
+cat("RMSE (GDD):", round(rmse, 1), "\n")
+cat("MAE  (GDD):", round(mae, 1), "\n")
+cat("Bias (GDD):", round(bias, 1), "\n")
+
+if (!all(is.na(cv_env$error_days))) {
+  rmse_d <- sqrt(mean(cv_env$error_days^2, na.rm = TRUE))
+  mae_d  <- mean(abs(cv_env$error_days), na.rm = TRUE)
+  bias_d <- mean(cv_env$error_days, na.rm = TRUE)
+  cat("LOEO-CV converted to days using mean_T (base 0): error_days = error_GDD / mean_T\n")
+  cat("RMSE (days):", round(rmse_d, 2), "\n")
+  cat("MAE  (days):", round(mae_d, 2), "\n")
+  cat("Bias (days):", round(bias_d, 2), "\n\n")}
+```
+
+```{R}
+# LOEO-CV observed vs predicted Plot
+g_scatter_cv <- ggplot(cv_env, aes(x = GDD_pred, y = GDD_obs)) +
+  geom_errorbarh(aes(xmin = GDD_pred_lo, xmax = GDD_pred_hi), height = 0, alpha = 0.6) +
+  geom_point(size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  coord_equal() +
+  labs(
+    x = "Predicted env mean GDD (LOEO-CV; mu only)",
+    y = "Observed env mean GDD",
+    title = "LOEO-CV: observed vs predicted environment means",
+    subtitle = paste0("RMSE=", round(rmse, 1), " GDD; MAE=", round(mae, 1),
+                      " GDD; Bias=", round(bias, 1))
+  ) +
+  theme_minimal(base_size = 14)
+
+print(g_scatter_cv)
+```
+
+```{R}
+# LOEO-CV Error Plot
+y_lab <- if (!all(is.na(cv_env$error_days))) "Observed − predicted (days)" else "Observed − predicted (GDD)"
+y_var <- if (!all(is.na(cv_env$error_days))) "error_days" else "error"
+
+Heading_EstError <- ggplot(cv_env, aes(x = reorder(as.character(environment), .data[[y_var]]), y = .data[[y_var]])) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_point(size = 3) +
+  coord_flip() +
+  labs(
+    x = "Trial",
+    y = y_lab,
+    title = "LOEO-CV heading prediction error"
+  ) +
+  theme_minimal(base_size = 14)
+print(Heading_EstError)
+```
+
+### Maturity Estimation ——————————————————————————-
+
+#### Library Import
+
+```{R}
+library(tidyverse)
+library(lme4)
+library(gsheet)
+library(ggplot2)
+library(readxl)
+```
+
+#### Data Input
+
+```{R}
+# Read and prepare xlsx file
+file_path <- here("InputData", "BoletimEmprabaMaturityPhenologicalEstimation_Input.xlsx")
+df <- read_excel(file_path) %>%
+  mutate(
+    site        = factor(site),
+    GDD_maturity = as.numeric(GDD_maturity),
+    days_to_maturity = as.numeric(days_to_maturity),
+    mean_temp_cycle = as.numeric(mean_temp_cycle),
+    year        = as.integer(year),
+    cultivar    = factor(cultivar),
+    environment = interaction(site, year, drop = TRUE)
+  ) %>%
+  filter(!site %in% c("Lavras", "Planaltina")) %>%
+  filter(!cultivar %in% c("BRS 264", "BRS264"))
+df$days_to_maturity <- as.integer(difftime(as.Date(df$maturity_date, format = "%Y-%m-%d"), as.Date(df$sowing_date, format = "%Y-%m-%d"), units = "days"))
+
+## Helper: pick the first available temperature-mean column for sowing->heading
+temp_candidates <- c("mean_temp_cycle", "Tmean_cycle", "tmean_cycle", "Tmean_sow_heading", "Tmean_sowing_heading")
+temp_col <- temp_candidates[temp_candidates %in% names(df)][1]
+if (is.na(temp_col)) temp_col <- NA_character_
+
+# Observed environment means
+obs_env <- df %>%
+  group_by(environment) %>%
+  summarise(
+    site        = first(site),
+    year        = first(year),
+    GDD_obs     = mean(GDD_maturity, na.rm = TRUE),
+    n_obs       = n(),
+    n_cultivars = n_distinct(cultivar),
+    mean_T      = if (!is.na(temp_col)) mean(.data[[temp_col]], na.rm = TRUE) else NA_real_,
+    .groups     = "drop"
+  )
+```
+
+#### Model fitting and Prediction
+
+```{R}
+# Fit mixed model
+m_gdd <- lmer(GDD_maturity ~ 1 + (1 | cultivar) + (1 | environment), data = df, REML = TRUE)
+confint(m_gdd)
+
+```
+
+```{R}
+# Predicted environment means: mu + BLUP(environment)
+mu_hat <- as.numeric(fixef(m_gdd)[1])
+var_mu_hat <- as.numeric(vcov(m_gdd)[1,1])
+
+re_env <- ranef(m_gdd, condVar = TRUE)$environment
+postVar_arr <- attr(re_env, "postVar")
+postVar_vec <- as.numeric(postVar_arr[1,1,])
+
+pred_env_in <- re_env %>%
+  rownames_to_column("environment") %>%
+  rename(b_env = `(Intercept)`) %>%
+  mutate(
+    postVar = postVar_vec,
+    se_pred = sqrt(var_mu_hat + postVar),
+    GDD_pred = mu_hat + b_env,
+    GDD_pred_lo = GDD_pred - 1.96 * se_pred,
+    GDD_pred_hi = GDD_pred + 1.96 * se_pred
+  ) %>%
+  dplyr::select(environment, GDD_pred, GDD_pred_lo, GDD_pred_hi, se_pred)
+```
+
+#### Evaluation assessment
+
+```{R}
+cmp_in <- obs_env %>%
+  left_join(pred_env_in, by = "environment") %>%
+  mutate(
+    error = GDD_obs - GDD_pred,
+    abs_error = abs(error)
+  )
+
+rmse_in <- sqrt(mean(cmp_in$error^2, na.rm = TRUE))
+mae_in  <- mean(cmp_in$abs_error, na.rm = TRUE)
+bias_in <- mean(cmp_in$error, na.rm = TRUE)
+
+cat("\nIn-sample (mu + env BLUP) agreement across environments\n")
+cat("RMSE (GDD):", round(rmse_in, 1), " | MAE (GDD):", round(mae_in, 1), " | Bias (GDD):", round(bias_in, 1))
+```
+
+```{R}
+# Observed vs predicted Plot
+MaturityEnvMeanCorrPlot <- ggplot(cmp_in, aes(GDD_pred, GDD_obs)) +
+  geom_errorbarh(aes(xmin = GDD_pred_lo, xmax = GDD_pred_hi), height = 0, alpha = 0.6) +
+  geom_point(size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  labs(
+    x = "Predicted trial mean GDD (mu + env BLUP)",
+    y = "Observed trial mean GDD",
+    title = "Maturity",
+    subtitle = paste0("RMSE=", round(rmse_in, 1),
+                      " GDD; MAE=", round(mae_in, 1),
+                      " GDD; Bias=", round(bias_in, 1))
+  ) +
+  theme_minimal(base_size = 14) +
+  coord_equal()
+print(MaturityEnvMeanCorrPlot)
+```
+
+```{R}
+# LOEO-CV evaluation
+envs <- obs_env$environment
+loeo <- map_dfr(envs, function(e_out) {
+  train <- df %>% filter(environment != e_out)
+  m <- lmer(GDD_maturity ~ 1 + (1 | cultivar) + (1 | environment),
+            data = train, REML = TRUE)
+  mu <- as.numeric(fixef(m)[1])
+  var_mu <- as.numeric(vcov(m)[1,1])
+  se_mu  <- sqrt(var_mu)
+  ci_lo  <- mu - 1.96 * se_mu
+  ci_hi  <- mu + 1.96 * se_mu
+  tibble(environment = e_out,
+         GDD_pred = mu,
+         GDD_pred_lo = ci_lo,
+         GDD_pred_hi = ci_hi,
+         se_pred = se_mu)
+})
+
+cv_env <- obs_env %>%
+  left_join(loeo, by = "environment") %>%
+  mutate(
+    error     = GDD_obs - GDD_pred,
+    abs_error = abs(error),
+    covered   = (GDD_obs >= GDD_pred_lo & GDD_obs <= GDD_pred_hi),
+    # convert GDD CI to days if mean_T available
+    error_days = if_else(!is.na(mean_T), error / mean_T, NA_real_),
+    GDD_pred_lo_days = if_else(!is.na(mean_T), GDD_pred_lo / mean_T, NA_real_),
+    GDD_pred_hi_days = if_else(!is.na(mean_T), GDD_pred_hi / mean_T, NA_real_)
+  )
+
+rmse <- sqrt(mean(cv_env$error^2, na.rm = TRUE))
+mae  <- mean(cv_env$abs_error, na.rm = TRUE)
+bias <- mean(cv_env$error, na.rm = TRUE)
+
+cat("\nLOEO-CV (new environment; prediction = mu only)\n")
+cat("RMSE (GDD):", round(rmse, 1), "\n")
+cat("MAE  (GDD):", round(mae, 1), "\n")
+cat("Bias (GDD):", round(bias, 1), "\n")
+```
+
+```{R}
+# LOEO-CV observed vs predicted Plot
+y_lab <- if (!all(is.na(cv_env$error_days))) "Observed − predicted (days)" else "Observed − predicted (GDD)"
+y_var <- if (!all(is.na(cv_env$error_days))) "error_days" else "error"
+
+MaturityErrorPlot <- ggplot(cv_env, aes(x = reorder(as.character(environment), .data[[y_var]]), y = .data[[y_var]])) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_point(size = 3) +
+  coord_flip() +
+  labs(
+    x = "Trial",
+    y = y_lab,
+    title = "LOEO-CV Maturity prediction error"
+  ) +
+  theme_minimal(base_size = 14)
+print(MaturityErrorPlot)
+```
+
+### Final Panel Export
+
+```{R}
+# Panel Plots ==================================================================
+library(patchwork)
+file_path <- here("OutputData", "HeadingAndMaturity_EstError.png")
+plot <- Heading_EstError | MaturityErrorPlot
+ggsave(file_path,
+       plot, width = 12, height = 6, units = "in", dpi = 600)
+
+file_path <- here("OutputData", "HeadingAndMaturity_MeanEnvCorrPlot.png")
+plot <- Heading_EnvMeansCorrPlot | MaturityEnvMeanCorrPlot
+ggsave(file_path,
+       plot, width = 12, height = 5, units = "in", dpi = 600)
+```

@@ -1,0 +1,528 @@
+---
+title: "Untitled"
+format: html
+editor: visual
+---
+
+```{R}
+# Library Import --------------------------------------------------
+library(tidyverse)
+library(sf)
+library(readxl)
+library(terra)
+library(sf)
+library(gstat)
+library(dplyr)
+library(mgcv)
+library(raster)
+library(sp)
+library(ggplot2)
+library(here)
+
+# Auxiliar variables definition -----------------------------------
+eps <- 1e-4
+grid_step <- 1
+use_custom_week_labels <- TRUE
+
+custom_week_breaks <- tibble(
+  week_id = 1:7,
+  doy_start = c(56, 62, 69, 76, 83, 90, 97),
+  doy_end   = c(61, 68, 75, 82, 89, 96, 105),
+  label     = c(
+    "Feb25–Mar03",
+    "Mar03–Mar10",
+    "Mar10–Mar17",
+    "Mar17–Mar24",
+    "Mar24–Mar31",
+    "Mar31–Apr07",
+    "Apr07–Apr15"
+  )
+)
+```
+
+```{R}
+# Gridded epidemic outbreak probability Input -----------------------------------
+file_path <- here("InputData", "PRI_emp.xlsx")
+df <- read_excel(file_path)
+stopifnot(all(c("latitude","longitude","time","Emp_ProbOR") %in% names(df)))
+
+# Dataframe Preparation ---------------------------------------------------------
+df_p <- df %>%
+  mutate(
+    lon = as.numeric(longitude),
+    lat = as.numeric(latitude),
+    pixel_id = paste0(round(lat, 4), "_", round(lon, 4)),
+    # convert "MM-DD" into a Date in a non-leap year (2001 chosen here)
+    date = as.Date(paste0("2001-", time), format = "%Y-%m-%d"),
+    doy  = as.integer(format(date, "%j")),
+    risk = as.numeric(Emp_ProbOR)
+  ) %>%
+  dplyr::select(pixel_id, lon, lat, doy, risk)
+
+df_p <- df_p %>%
+  mutate(
+    risk_adj = pmin(pmax(risk, eps), 1 - eps),
+    logit_r  = qlogis(risk_adj)
+  )
+```
+
+```{R}
+# Function Definition -----------------------------------------------------------
+# Predict smooth risk curve and retrieve optimal sowing date
+fit_pixel_curve <- function(doy, logit_r, doy_grid = NULL) {
+  ok <- is.finite(doy) & is.finite(logit_r)
+  doy <- doy[ok]; logit_r <- logit_r[ok]
+  if (length(doy) < 4) return(NULL)
+  o <- order(doy); doy <- doy[o]; logit_r <- logit_r[o]
+  if (is.null(doy_grid)) doy_grid <- seq(min(doy), max(doy), by = 1)
+
+  sp <- tryCatch(smooth.spline(x = doy, y = logit_r, cv = TRUE), error = function(e) NULL)
+  if (is.null(sp)) return(NULL)
+
+  pred_logit <- predict(sp, x = doy_grid)$y
+  pred_risk  <- plogis(pred_logit)
+  i_min <- which.min(pred_risk)
+
+  tibble(
+    doy_opt   = doy_grid[i_min],
+    risk_min  = pred_risk[i_min],
+    doy_min   = min(doy),
+    doy_max   = max(doy)
+  )
+}
+
+# Predict and retrieve smooth risk curve for specific locations
+make_pixel_curve <- function(doy, logit_r, grid_step = 1) {
+  ok <- is.finite(doy) & is.finite(logit_r)
+  doy <- doy[ok]; logit_r <- logit_r[ok]
+  if (length(doy) < 4) return(NULL)
+  o <- order(doy); doy <- doy[o]; logit_r <- logit_r[o]
+  doy_grid <- seq(min(doy), max(doy), by = grid_step)
+  sp <- tryCatch(smooth.spline(doy, logit_r, cv = TRUE), error = function(e) NULL)
+  if (is.null(sp)) return(NULL)
+  tibble(doy = doy_grid, risk_fit = plogis(predict(sp, x = doy_grid)$y))
+}
+```
+
+```{R}
+# Predict Pixel wise Joint Prob. curves -------------------------------------
+pixel_opt <- df_p %>%
+  group_by(pixel_id) %>%
+  summarise(
+    opt = list(fit_pixel_curve(doy, logit_r, doy_grid = seq(min(doy), max(doy), by = grid_step))),
+    lon = first(lon),
+    lat = first(lat),
+    .groups = "drop"
+  ) %>%
+  unnest(opt)
+
+pixel_opt <- pixel_opt %>% filter(!is.na(doy_opt))
+
+# Classify optimal sowing dates into 7-day temporal bins
+pixel_opt <- pixel_opt %>% mutate(week_opt = floor((doy_opt - 1) / 7) + 1)
+```
+
+```{R}
+# Assign custom week labels based on DOY interval ----------------------------------------
+if (use_custom_week_labels) {
+  starts <- custom_week_breaks$doy_start
+  ends   <- custom_week_breaks$doy_end
+  labels <- custom_week_breaks$label
+  idx <- findInterval(pixel_opt$doy_opt, vec = starts)
+  wlab <- rep(NA_character_, nrow(pixel_opt))
+  valid_idx <- which(idx > 0 & idx <= length(labels))
+  if (length(valid_idx) > 0) {
+    sel <- valid_idx[pixel_opt$doy_opt[valid_idx] <= ends[idx[valid_idx]]]
+    wlab[sel] <- labels[idx[sel]]
+  }
+  pixel_opt$week_label <- wlab
+}
+
+print(pixel_opt %>% summarise(n_pixels = n(), mean_opt = mean(doy_opt), sd_opt = sd(doy_opt)))
+```
+
+```{R}
+# Plot sample pixel-wise risk curves -------------------------------------------
+set.seed(5)
+sample_pixels <- sample(unique(df_p$pixel_id), size = min(12, n_distinct(df_p$pixel_id)))
+
+curves_sample <- df_p %>%
+  filter(pixel_id %in% sample_pixels) %>%
+  group_by(pixel_id) %>%
+  summarise(curve = list(make_pixel_curve(doy, logit_r, grid_step = 1)), .groups = "drop") %>%
+  unnest(curve)
+
+obs_sample <- df_p %>% filter(pixel_id %in% sample_pixels) %>% transmute(pixel_id, doy, risk = risk_adj)
+
+p_curve_sample <- ggplot() +
+  geom_line(data = curves_sample, aes(doy, risk_fit, group = pixel_id), linewidth = 0.8) +
+  geom_point(data = obs_sample, aes(doy, risk, group = pixel_id), size = 1.7) +
+  facet_wrap(~pixel_id) +
+  labs(x = "Sowing date (DOY)", y = "Predicted joint probabilities", title = "Pixel-wise risk curves") +
+  theme_minimal(base_size = 12)
+file_path <- here("OutputData", "SowingDateJointProbCurves.png")
+ggsave(file_path,
+       p_curve_sample, units = "in", dpi = 600)
+print(p_curve_sample)
+```
+
+```{R}
+# Optimal sowing week distribution exploratory analysis ------------------------
+ggplot(pixel_opt, aes(doy_opt)) +
+  geom_histogram(bins = 30) +
+  labs(x = "Optimal sowing DOY (risk-minimizing)", y = "Number of pixels",
+       title = "Distribution of pixel-level optimal sowing dates") +
+  theme_minimal(base_size = 13)
+
+if (use_custom_week_labels) {
+  ggplot(pixel_opt, aes(fct_infreq(week_label))) +
+    geom_bar() + coord_flip() +
+    labs(x = "Optimal sowing week (label)", y = "Pixels",
+         title = "Pixel-level optimal sowing week (classified)") +
+    theme_minimal(base_size = 13)
+}
+```
+
+\
+
+```{R}
+# Create grid template --------------------------------------------------
+r_tmpl <- rast(
+  xmin = min(pixel_opt$lon),
+  xmax = max(pixel_opt$lon),
+  ymin = min(pixel_opt$lat),
+  ymax = max(pixel_opt$lat),
+  resolution = 0.01,
+  crs = "OGC:CRS84"
+)
+
+# Input and resample altitude raster -----------------------------------
+alt <- rast("D:/Igor_Masters/Auxiliar/Clipped_MDE.tif")
+alt <- resample(alt, r_tmpl, method = "bilinear")
+
+# Extracts altitude values ---------------------------------------------
+pixel_opt$altitude <- terra::extract(
+  alt,
+  vect(pixel_opt[, c("lon", "lat")], geom = c("lon", "lat"), crs = "OGC:CRS84")
+)[, 2]
+pixel_opt <- pixel_opt %>% filter(!is.na(altitude))
+
+# Fit GAM model for spatial and altitude trend -------------------------
+gam_trend <- gam(
+  doy_opt ~ s(lon, lat, k = 120) + s(altitude, k = 10),
+  data = pixel_opt,
+  method = "REML"
+)
+summary(gam_trend)
+
+# Creates spatial class object -----------------------------------------
+pixel_opt$resid <- residuals(gam_trend)
+pts_sf <- st_as_sf(
+  pixel_opt,
+  coords = c("lon", "lat"),
+  crs = "OGC:CRS84"
+)
+pts_sp <- as(pts_sf, "Spatial")
+
+# Residue Spatial autocorrelation ------------------------------------------------
+# Grid Preparation
+pts_sf$resid <- pixel_opt$resid
+pts_sf_m <- st_transform(pts_sf, crs = 5880)
+coords <- st_coordinates(pts_sf_m)
+
+# Auxiliary variables definition
+npts <- nrow(coords)
+max_sample <- 3000L
+if(npts > max_sample){
+  samp <- sample(seq_len(npts), max_sample)
+  maxdist <- max(sp::spDists(coords[samp, ], longlat = FALSE), na.rm = TRUE)
+} else {
+  maxdist <- max(sp::spDists(coords, longlat = FALSE), na.rm = TRUE)
+}
+cutoff <- maxdist * 0.5
+nbins  <- 25
+width  <- cutoff / nbins
+message(sprintf("npts=%d ; maxdist=%.0f m ; cutoff=%.0f m ; width=%.0f m",
+                npts, maxdist, cutoff, width))
+resid_var   <- var(pixel_opt$resid, na.rm = TRUE)
+init_nugget <- resid_var * 0.05
+init_psill  <- resid_var * 0.95
+init_range  <- cutoff / 3
+message(sprintf("init nugget=%.4g ; init psill=%.4g ; init range=%.0f m",
+                init_nugget, init_psill, init_range))
+
+# Fit empirical variogram
+vgm_emp <- variogram(resid ~ 1, data = pts_sf_m, cutoff = cutoff, width = width)
+
+# Declaring initial theoretical variogram model
+vgm_init <- vgm(psill = init_psill, model = "Gau", range = init_range, nugget = init_nugget)
+
+# Fit variogram with fallback
+vgm_mod <- tryCatch({
+  fit.variogram(vgm_emp, vgm_init, fit.method = 6)
+}, error = function(e){
+  message("Initial fit failed: ", e$message)
+  # looser fallback (larger nugget)
+  vgm_fb <- vgm(psill = resid_var * 0.7, model = "Gau", range = cutoff/4, nugget = resid_var * 0.3)
+  tryCatch(fit.variogram(vgm_emp, vgm_fb, fit.method = 6),
+           error = function(e2){
+             message("Fallback fit also failed: ", e2$message)
+             NULL
+           })
+})
+if(is.null(vgm_mod)) stop("Variogram fitting failed. Inspect vgm_emp and initial guesses.")
+
+# Empirical x theoretical variograms plot
+plot(vgm_emp, vgm_mod, main = "Empirical variogram & fitted Gaussian model (EPSG:5880)")
+
+# directional variograms (anisotropy check)
+vgm_dir <- variogram(resid ~ 1, data = pts_sf_m,
+                     alpha = c(0, 45, 90, 135),
+                     tol.hor = 22.5, cutoff = cutoff, width = width)
+plot(vgm_dir, main = "Directional variograms (0,45,90,135 deg)")
+
+# Grid-search refinement of range
+ranges_try <- seq(cutoff * 0.05, cutoff * 0.8, length.out = 25)
+rss_vec <- numeric(length(ranges_try))
+for(i in seq_along(ranges_try)){
+  mtry <- vgm(psill = init_psill, model = "Gau", range = ranges_try[i], nugget = init_nugget)
+  theo <- variogramLine(mtry, dist_vector = vgm_emp$dist)
+  rss_vec[i] <- sum((vgm_emp$gamma - theo)^2 * vgm_emp$np, na.rm = TRUE)
+}
+best_idx <- which.min(rss_vec)
+message(sprintf("Grid-search best range = %.0f m (index %d)", ranges_try[best_idx], best_idx))
+
+# refit using best range
+vgm_init2 <- vgm(psill = init_psill, model = "Gau", range = ranges_try[best_idx], nugget = init_nugget)
+vgm_mod2 <- tryCatch(fit.variogram(vgm_emp, vgm_init2, fit.method = 6),
+                     error = function(e){ message("Refit failed: ", e$message); vgm_mod })
+vgm_mod_final <- if(!is.null(vgm_mod2)) vgm_mod2 else vgm_mod
+
+
+# Plot final variogram -------------------------------------------------
+emp_df <- as.data.frame(vgm_emp)
+if (!all(c("dist","gamma") %in% names(emp_df))) {
+  stop("empirical variogram does not contain 'dist' and 'gamma' columns. Inspect names(emp_df).")
+}
+maxd <- max(emp_df$dist, na.rm = TRUE)
+model_df <- as.data.frame(variogramLine(vgm_mod_final, maxdist = maxd, n = 250))
+p_semivar <- ggplot(emp_df, aes(x = dist, y = gamma)) +
+  geom_point(size = 2, alpha = 0.8) +                       # empirical points
+  geom_line(data = model_df, aes(x = dist, y = gamma),     # fitted model line
+            linewidth = 1) +
+  labs(
+    title = "Empirical variogram & final fitted Gaussian model",
+    x = "Distance",
+    y = "Semivariance"
+  ) +
+  theme_minimal(base_size = 14)
+print(p_semivar)
+file_path <- here("OutputData", "SemiVariogram_ggplotify.png")
+ggsave(file_path, plot = p_semivar, dpi = 600)
+
+# Variogram fit diagnostics
+theo <- variogramLine(vgm_mod_final, dist_vector = vgm_emp$dist)
+if(is.matrix(theo) || is.data.frame(theo)) {
+  theo_gamma <- as.numeric(theo[,2])
+} else {
+  theo_gamma <- as.numeric(theo)
+}
+weights <- vgm_emp$np
+rss <- sum((vgm_emp$gamma - theo_gamma)^2 * weights, na.rm = TRUE)
+w_rmse <- sqrt(rss / sum(weights, na.rm = TRUE))
+tss <- sum((vgm_emp$gamma - weighted.mean(vgm_emp$gamma, w = weights, na.rm = TRUE))^2 * weights, na.rm = TRUE)
+r2_vario <- 1 - rss / tss
+cat("Variogram fit diagnostics:\n")
+cat(sprintf("  weighted RMSE (semivariance) = %.6g\n", w_rmse))
+cat(sprintf("  weighted RSS (semivariance)     = %.6g\n", rss))
+cat(sprintf("  R2-like (semivariance fit)      = %.4f\n\n", r2_vario))
+
+# Kriging cross-validation ---------------------------------------------------
+pts_sp_m <- as(pts_sf_m, "Spatial")
+cv <- tryCatch({
+  gstat::krige.cv(resid ~ 1, pts_sp_m, model = vgm_mod_final)
+}, error = function(e){
+  stop("krige.cv failed: ", e$message)
+})
+cv_df <- as.data.frame(cv)
+obs <- cv_df$resid
+pred <- cv_df$var1.pred
+pred_var <- cv_df$var1.var
+err <- obs - pred
+ME   <- mean(err, na.rm = TRUE)
+RMSE <- sqrt(mean(err^2, na.rm = TRUE))
+MAE  <- mean(abs(err), na.rm = TRUE)
+MSPE <- mean(err^2 / pred_var, na.rm = TRUE)
+std_err <- err / sqrt(pred_var)
+mean_std <- mean(std_err, na.rm = TRUE)
+sd_std   <- sd(std_err, na.rm = TRUE)
+
+cat("Kriging CV diagnostics:\n")
+cat(sprintf("  ME   = %.6g\n", ME))
+cat(sprintf("  RMSE = %.6g\n", RMSE))
+cat(sprintf("  MAE  = %.6g\n", MAE))
+cat(sprintf("  MSPE (mean err^2 / var_pred) = %.3f (ideal ≈ 1)\n", MSPE))
+cat(sprintf("  mean(std.err) = %.3f  |  sd(std.err) = %.3f  (ideal mean≈0, sd≈1)\n", mean_std, sd_std))
+
+# Kriging ------------------------------------------------------------------
+# Grid and data preparation
+grid_sp <- as.points(r_tmpl)
+grid_sp <- as(grid_sp, "Spatial")
+grid_sp$altitude <- terra::extract(alt, vect(grid_sp))[, 2]
+pts_sf <- st_as_sf(
+  pixel_opt,
+  coords = c("lon", "lat"),
+  crs = "OGC:CRS84"
+)
+pts_sp <- as(pts_sf, "Spatial")
+
+# Ordinary kriging of GAM residuals
+krig_resid <- krige(
+  formula = resid ~ 1,
+  locations = pts_sp,
+  newdata = grid_sp,
+  model = vgm_mod_final
+)
+
+# Smoothed Optimal sowing day raster creation -------------------------------------------
+# Predicts large-scale trend on the grid
+grid_df <- as.data.frame(grid_sp)
+grid_df$trend <- predict(
+  gam_trend,
+  newdata = data.frame(
+    lon = grid_df$x,
+    lat = grid_df$y,
+    altitude = grid_df$altitude
+  )
+)
+# Combines GAM trend and kriged residuals
+grid_df$doy_opt_final <- grid_df$trend + krig_resid$var1.pred
+
+# Create smothed optimal sowing raster
+r_final <- rast(
+  grid_df[, c("x", "y", "doy_opt_final")],
+  type = "xyz",
+  crs = "OGC:CRS84"
+)
+names(r_final) <- "doy_opt_GAM_kriged"
+plot(r_final)
+file_path <- here("OutputData", "OPTSowingDate.tif")
+writeRaster(r_final, file_path, overwrite = TRUE)
+```
+
+```{R}
+# Prepare Sowing window classes ----------------------------------------------
+ref_year <- 2001
+origin_date <- as.Date(paste0(ref_year, "-01-01"))
+class_dates <- data.frame(
+  value = 1:10,
+  date_from = as.Date(c(
+    "2001-02-15",  # 1
+    "2001-02-22",  # 2
+    "2001-02-25",  # 3
+    "2001-03-03",  # 4
+    "2001-03-10",  # 5
+    "2001-03-17",  # 6
+    "2001-03-24",  # 7
+    "2001-03-31",  # 8
+    "2001-04-07",  # 9
+    "2001-04-15"   # 10
+  ),
+  stringsAsFactors = FALSE
+))
+class_dates$date_to <- as.Date(c(
+  "2001-02-22",
+  "2001-02-25",
+  "2001-03-03",
+  "2001-03-10",
+  "2001-03-17",
+  "2001-03-24",
+  "2001-03-31",
+  "2001-04-07",
+  "2001-04-15",
+  "2001-04-22"
+))
+class_dates$doy_from <- as.integer(class_dates$date_from - origin_date + 1)
+class_dates$doy_to   <- as.integer(class_dates$date_to   - origin_date + 1)
+print(class_dates[, c("value", "date_from", "date_to", "doy_from", "doy_to")])
+
+rcl <- as.matrix(class_dates[, c("doy_from", "doy_to", "value")])
+vals <- values(r_final)
+vals <- vals[!is.na(vals)]
+print(summary(vals))
+print(quantile(vals, probs = c(0.01, 0.05, 0.95, 0.99)))
+hist(vals, breaks = 50, main = "Distribution of optimal sowing DOY", xlab = "Day of year", col = "grey")
+
+# --- classify using the 10 fixed classes ---------------------------------------
+r_zone <- classify(r_final, rcl, include.lowest = TRUE, right = FALSE)
+
+labels_vec <- c(
+  "15/02 – 22/02",
+  "22/02 – 25/02",
+  "25/02 – 03/03",
+  "03/03 – 10/03",
+  "10/03 – 17/03",
+  "17/03 – 24/03",
+  "24/03 – 31/03",
+  "31/03 – 07/04",
+  "07/04 – 15/04",
+  "15/04 – 22/04"
+)
+
+levels(r_zone) <- data.frame(value = class_dates$value, label = labels_vec)
+
+# check whether any values remain outside the envelope ---------------------
+min_envelope <- min(class_dates$doy_from)
+max_envelope <- max(class_dates$doy_to)
+
+n_outside <- sum(vals < min_envelope | vals >= max_envelope, na.rm = TRUE)
+pct_outside <- 100 * n_outside / length(vals)
+
+cat(sprintf("Pixels outside  [%d, %d) DOY envelope: %d (%.3f %%)\n",
+            min_envelope, max_envelope, n_outside, pct_outside))
+
+# If there are any outside pixels, create explicit early/late classes and reclassify
+if (n_outside > 0) {
+  cat("Found outside pixels → creating explicit <early and >late classes and reclassifying.\n")
+  class_dates_ext <- rbind(
+    data.frame(value = 0,
+               date_from = NA,
+               date_to   = NA,
+               doy_from  = -Inf,
+               doy_to    = min_envelope, stringsAsFactors = FALSE),
+    class_dates,
+    data.frame(value = max(class_dates$value) + 1,
+               date_from = NA,
+               date_to   = NA,
+               doy_from  = max_envelope,
+               doy_to    = Inf, stringsAsFactors = FALSE)
+  )
+
+  rcl_ext <- as.matrix(class_dates_ext[, c("doy_from", "doy_to", "value")])
+
+  r_zone <- classify(r_final, rcl_ext, include.lowest = TRUE, right = FALSE)
+
+  # labels for extended scheme (add early/late)
+  labels_ext <- c(paste0("< ", format(origin_date + min_envelope - 1, "%d/%m")),
+                  labels_vec,
+                  paste0("> ", format(origin_date + max_envelope - 1, "%d/%m")))
+  levels(r_zone) <- data.frame(value = class_dates_ext$value, label = labels_ext)
+}
+
+# --- plot (categorical) -------------------------------------------------------
+cols <- hcl.colors(length(levels(r_zone)[[1]]$value), "viridis")
+plot(r_zone, col = cols, plg = list(title = "Optimal sowing window"))
+
+# --- frequency / summary ------------------------------------------------------
+print(freq(r_zone))                    # count per class
+na_count <- as.numeric(terra::global(is.na(r_zone), "sum", na.rm = TRUE))
+cat("Total NA pixels in r_zone:", na_count, "\n")
+
+# --- export --------------------------------------------------------
+file_path <- here("OutputData", "OPTSowingDateZone.tif")
+writeRaster(r_zone, file_path, overwrite = TRUE)
+
+# final envelope info
+cat("Final min/max of r_final (DOY):\n"); print(global(r_final, c("min", "max"), na.rm = TRUE))
+
+```
